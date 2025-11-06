@@ -1,0 +1,50 @@
+# ===== Build folders (generic) =====
+Debug/
+Release/
+build/
+# ===== STM32 / toolchains =====
+.settings/
+.metadata/
+*.launch
+*.uvprojx
+*.uvoptx
+*.uvgui*
+MDK-ARM/
+EWARM/
+SW4STM32/
+# ===== Objects & artifacts =====
+*.o
+*.d
+*.elf
+*.map
+*.lst
+*.bin
+*.hex
+*.log
+# ===== Python cache =====
+__pycache__/
+*.pyc
+# ===== OS noise =====
+.DS_Store
+Thumbs.db
+desktop.ini
+# ===== Editors =====
+.vscode/
+.idea/
+# ===== Gateway (Node-RED / Node.js) =====
+Gateway/node_modules/
+Gateway/*.log
+Gateway/*.sqlite
+Gateway/*.db
+Gateway/db/*.db
+# Node-RED credential files
+Gateway/flows_cred.json
+Gateway/flows_*_cred.json
+# Env & build
+Gateway/.env
+Gateway/.env.*
+Gateway/dist/
+Gateway/build/
+# Backup flows
+Gateway/flows*.json.backup
+Gateway/flows*.json.bak

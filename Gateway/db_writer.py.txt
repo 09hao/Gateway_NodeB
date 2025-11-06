@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# MQTT -> SQLite writer (thoi gian local lam chinh)
+# - ts:      uu tien data.time (local tu Node); neu khong co thi dung up["ts"]
+#            (neu up["ts"] co "Z" hoac offset thi doi ve local), neu van khong
+#            co thi dung gio hien tai cua may Pi
+# - ts_utc:  de mo rong neu gateway gui rieng truong UTC (co the None)
+# - ts_gw:   thoi diem may Pi ghi (local)
+#
+# File nay se:
+#   1) tao DB va bang neu chua co
+#   2) tu dong ALTER TABLE de them cac cot con thieu
+#   3) khi INSERT chon dung cac cot dang ton tai (tranh loi so cot)
+#
+# Cach chay:
+#   mkdir -p /home/pi/gw/db
+#   python3 db_writer.py
+
+import os, sys, json, sqlite3
+from datetime import datetime
+import paho.mqtt.client as mqtt
+
+# ===== MQTT config =====
+SITE  = "farmA"
+GWID  = "pi3b"
+HOST  = "localhost"
+PORT  = 1883
+USER  = "hhao"
+PASS  = "8888"
+
+TOP_UPLINK = f"site/{SITE}/gw/{GWID}/node/+/uplink"
+TOP_EVENTS = f"site/{SITE}/events"
+
+# ===== SQLite config =====
+DB_PATH = "/home/pi/gw/db/gateway.db"
+
+# ===== Helper =====
+def log(s): print(f"[WRITER] {s}", flush=True)
+
+def ensure_dirs():
+    d = os.path.dirname(DB_PATH)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+def now_local_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+def utc_to_local_str(ts_utc: str):
+    # '2025-11-03T04:26:31Z' hoac '2025-11-03T04:26:31+00:00' -> local 'YYYY-MM-DD HH:MM:SS'
+    if not ts_utc: return None
+    try:
+        s = ts_utc.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def normalize_node_time(s: str):
+    # chuan hoa 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DDTHH:MM:SS[.xxx][Z]'
+    if not s: return None
+    try:
+        s2 = s.replace('T', ' ').split('.')[0].replace('Z','').strip()
+        datetime.strptime(s2, "%Y-%m-%d %H:%M:%S")
+        return s2
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(s.replace('Z',''))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return s  # tra ve chuoi goc neu khong parse duoc
+
+# ===== DB =====
+SCHEMA_READINGS = """
+CREATE TABLE IF NOT EXISTS readings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    ts_utc     TEXT,
+    ts_gw      TEXT,
+    gwid       TEXT,
+    node       TEXT,
+    ver        INTEGER,
+    type       TEXT,
+    seq        INTEGER,
+    node_time  TEXT,
+    soil       REAL,
+    rainpct    REAL,
+    rain       INTEGER,
+    rh         REAL,
+    t          REAL,
+    st         TEXT,
+    pump       INTEGER,
+    dht_fault  INTEGER,
+    hist       INTEGER,
+    crc        TEXT,
+    rssi       REAL,
+    snr        REAL,
+    raw        TEXT,
+    mode       TEXT
+);
+"""
+
+SCHEMA_EVENTS = """
+CREATE TABLE IF NOT EXISTS events (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       TEXT,
+    level    TEXT,
+    message  TEXT
+);
+"""
+
+# danh sach cot ky vong (de auto ALTER TABLE neu thieu)
+REQUIRED_COLS = {
+    "ts":"TEXT","ts_utc":"TEXT","ts_gw":"TEXT","gwid":"TEXT",
+    "node":"TEXT","ver":"INTEGER","type":"TEXT","seq":"INTEGER","node_time":"TEXT",
+    "soil":"REAL","rainpct":"REAL","rain":"INTEGER","rh":"REAL","t":"REAL","st":"TEXT",
+    "pump":"INTEGER","dht_fault":"INTEGER","hist":"INTEGER","crc":"TEXT",
+    "rssi":"REAL","snr":"REAL","raw":"TEXT",
+    "mode":"TEXT"
+}
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    cur.execute("PRAGMA busy_timeout=3000;")
+    # tao bang neu chua co
+    cur.execute(SCHEMA_READINGS)
+    cur.execute(SCHEMA_EVENTS)
+    # index co ban
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_node_ts ON readings(node, ts);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_readings_ts      ON readings(ts);")
+    conn.commit()
+    return conn
+
+def table_columns(conn, table):
+    cur = conn.cursor()
+    return [r[1] for r in cur.execute(f"PRAGMA table_info({table});")]
+
+def migrate_columns(conn):
+    # tu dong them cac cot con thieu
+    cur = conn.cursor()
+    have = set(table_columns(conn, "readings"))
+    added = []
+    for name, typ in REQUIRED_COLS.items():
+        if name not in have:
+            cur.execute(f"ALTER TABLE readings ADD COLUMN {name} {typ};")
+            added.append(name)
+    if added:
+        log(f"added columns: {', '.join(added)}")
+    conn.commit()
+
+def qname(name):
+    # quote "type" vi la tu khoa trong SQLite
+    return '"type"' if name == "type" else name
+
+def insert_reading(conn, values_dict):
+    # chon cac cot vua co trong DB vua co trong dict
+    cols_have = set(table_columns(conn, "readings"))
+    cols = [c for c in REQUIRED_COLS.keys() if c in cols_have and c in values_dict]
+    if not cols:
+        return
+    sql = f"INSERT INTO readings({','.join(qname(c) for c in cols)}) VALUES({','.join('?' for _ in cols)})"
+    vals = [values_dict[c] for c in cols]
+    conn.execute(sql, vals)
+    conn.commit()
+
+def insert_event(conn, ts, level, msg):
+    cols_have = set(table_columns(conn, "events"))
+    cols_vals = [(k,v) for k,v in (("ts",ts),("level",level),("message",msg)) if k in cols_have]
+    if not cols_vals: return
+    cols = [k for k,_ in cols_vals]
+    vals = [v for _,v in cols_vals]
+    sql = f"INSERT INTO events({','.join(cols)}) VALUES({','.join('?' for _ in cols)})"
+    conn.execute(sql, vals)
+    conn.commit()
+    
+# ===== MQTT callbacks =====
+def on_connect(c, *_):
+    log(f"MQTT connected -> SUB {TOP_UPLINK} & {TOP_EVENTS}")
+    c.subscribe(TOP_UPLINK, qos=0)
+    c.subscribe(TOP_EVENTS, qos=0)
+
+def on_disconnect(c, u, rc):
+    log(f"MQTT disconnected rc={rc} -> auto-reconnect...")
+
+def make_on_message(conn):
+    def _cb(c, u, msg):
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode()
+
+            if topic.endswith("/uplink"):
+                up = json.loads(payload)      # {'node','data','rssi','snr','ts' (local hoac UTC)}
+                d  = up.get("data", {})
+
+                # === thoi gian ===
+                ts_node = normalize_node_time(d.get("time"))   # local do Node gui (uu tien)
+                raw_ts  = up.get("ts")                         # gateway dang thuong gui LOCAL
+                # neu 'ts' co dau hieu UTC thi convert -> local, nguoc lai dung nguyen (co chuan hoa)
+                if raw_ts and ('Z' in raw_ts or '+' in raw_ts):
+                    ts_from_up = utc_to_local_str(raw_ts)
+                else:
+                    ts_from_up = normalize_node_time(raw_ts)
+
+                ts_gw  = now_local_str()                      # local ngay luc ghi
+                ts     = ts_node or ts_from_up or ts_gw
+                ts_utc = up.get("ts_utc")                     # de None neu gateway khong gui rieng
+
+                # === map gia tri ===
+                V = {
+                    "ts": ts,
+                    "ts_utc": ts_utc,
+                    "ts_gw": ts_gw,
+                    "gwid": GWID,
+                    "node": up.get("node"),
+                    "ver": d.get("ver"),
+                    "type": d.get("type"),
+                    "seq": d.get("seq"),
+                    "node_time": d.get("time"),
+                    "soil": d.get("soil"),
+                    "rainpct": d.get("rainpct"),
+                    "rain": d.get("rain"),
+                    "rh": d.get("rh"),
+                    "t": d.get("t"),
+                    "st": d.get("st"),
+                    "pump": d.get("pump"),
+                    "dht_fault": d.get("dht_fault"),
+                    "hist": d.get("hist"),
+                    "crc": d.get("crc"),
+                    "rssi": up.get("rssi"),
+                    "snr": up.get("snr"),
+                    "raw": json.dumps(up, separators=(',',':')),
+                    "mode": d.get("mode")          # AUTO / MANUAL (neu co)
+                }
+
+                insert_reading(conn, V)
+                log(f"INSERT readings ok  ts={ts} node={up.get('node')} seq={d.get('seq')}")
+
+            elif topic.endswith("/events"):
+                e = json.loads(payload)  # {'level','msg','ts' (co the UTC hoac local)}
+                raw_ts = e.get("ts")
+                if raw_ts and ('Z' in raw_ts or '+' in raw_ts):
+                    ts_ev = utc_to_local_str(raw_ts) or now_local_str()
+                else:
+                    ts_ev = normalize_node_time(raw_ts) or now_local_str()
+                insert_event(conn, ts_ev, e.get("level","info"), e.get("msg",""))
+                log(f"INSERT events ok  level={e.get('level')}")
+        except Exception as ex:
+            log(f"ERROR: {ex}")
+            try:
+                insert_event(conn, now_local_str(), "error", f"writer: {ex}")
+            except: pass
+    return _cb
+
+# ===== main =====
+def main():
+    ensure_dirs()
+    log(f"DB = {DB_PATH}")
+    conn = db_connect()
+    migrate_columns(conn)  # tu dong them cot thieu neu co
+
+    log(f"MQTT {HOST}:{PORT} user={USER}")
+    cli = mqtt.Client("db-writer")
+    cli.username_pw_set(USER, PASS)
+    cli.on_connect = on_connect
+    cli.on_disconnect = on_disconnect
+    cli.on_message = make_on_message(conn)
+
+    try:
+        cli.connect(HOST, PORT, 60)
+        log("Connecting...")
+    except Exception as e:
+        log(f"CONNECT FAILED: {e}")
+        sys.exit(2)
+
+    cli.loop_forever(retry_first_connection=True)
+
+if __name__ == "__main__":
+    main()

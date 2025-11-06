@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time, json, sys, signal, struct
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo 
+import re, threading
+LOCAL_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+import spidev
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+
+# ====== Wiring (BCM) ======
+PIN_CS   = 8    # CE0 (SPI chip select)
+PIN_RST  = 22   # Reset
+PIN_DIO0 = 27   # RxDone / TxDone
+
+# ====== RF config (kh?p Node B) ======
+FREQ_HZ       = 433_000_000
+SYNC_WORD     = 0x34
+SPREADING_SF  = 9           # 7..12
+BANDWIDTH_HZ  = 125000
+CODERATE_DEN  = 5           # 5->4/5, 6->4/6, 7->4/7, 8->4/8
+PREAMBLE_SYM  = 14
+TX_POWER_DBM  = 17
+OCP_MA        = 100         # 45..240 mA
+USE_PA_BOOST  = True
+
+# ====== ACK policy ======
+ACK_DELAY_S     = 0.20      # trÃ¬ hoÃ£n nh? d? Node k?p vÃ o RX
+ACK_REPEATS     = 4         # l?p ACK d? ch?c an
+ACK_SPACING_S   = 0.05
+FULL_ACK        = False     # True -> dÃ­nh kÃ¨m rssi/snr trong ACK JSON
+
+# ====== Misc ======
+PRINT_DUPLICATES   = False   # v?n ACK b?n trÃ¹ng, ch? ?n log l?p
+LOG_PREFIX         = "[GW] "
+WATCHDOG_SEC       = 30      # khÃ´ng RX quÃ¡ N giÃ¢y thÃ¬ re-init radio (0 = t?t)
+
+# ====== MQTT config ======
+SITE = "farmA"
+GWID = "pi3b"
+MQTT_HOST = "localhost"
+MQTT_PORT = 1883
+MQTT_USER = "hhao"
+MQTT_PASS = "8888"
+
+MQTT_TOPIC_UPLINK = f"site/{SITE}/gw/{GWID}/node/{{node}}/uplink"
+MQTT_TOPIC_STATUS = f"site/{SITE}/gw/{GWID}/status"
+MQTT_TOPIC_EVENTS = f"site/{SITE}/events"                  # optional
+MQTT_TOPIC_CMD    = f"site/{SITE}/gw/{GWID}/node/+/downlink/cmd" 
+
+# ====== LoRa registers (SX1276/77/78) ======
+REG_FIFO                 = 0x00
+REG_OP_MODE              = 0x01
+REG_FRF_MSB              = 0x06
+REG_FRF_MID              = 0x07
+REG_FRF_LSB              = 0x08
+REG_PA_CONFIG            = 0x09
+REG_OCP                  = 0x0B
+REG_LNA                  = 0x0C
+REG_FIFO_ADDR_PTR        = 0x0D
+REG_FIFO_TX_BASE_ADDR    = 0x0E
+REG_FIFO_RX_BASE_ADDR    = 0x0F
+REG_FIFO_RX_CURRENT_ADDR = 0x10
+REG_IRQ_FLAGS            = 0x12
+REG_RX_NB_BYTES          = 0x13
+REG_PKT_SNR_VALUE        = 0x19
+REG_PKT_RSSI_VALUE       = 0x1A
+REG_MODEM_CONFIG1        = 0x1D
+REG_MODEM_CONFIG2        = 0x1E
+REG_SYMB_TIMEOUT_LSB     = 0x1F
+REG_PREAMBLE_MSB         = 0x20
+REG_PREAMBLE_LSB         = 0x21
+REG_PAYLOAD_LENGTH       = 0x22
+REG_MODEM_CONFIG3        = 0x26
+REG_DETECT_OPTIMIZE      = 0x31
+REG_DETECTION_THRESHOLD  = 0x37
+REG_SYNC_WORD            = 0x39
+REG_DIO_MAPPING1         = 0x40
+REG_VERSION              = 0x42
+REG_PA_DAC               = 0x4D
+
+# OP mode bits
+MODE_LONG_RANGE_MODE = 0x80
+MODE_SLEEP   = 0x00
+MODE_STDBY   = 0x01
+MODE_TX      = 0x03
+MODE_RXCONT  = 0x05
+
+# IRQ flags
+IRQ_RXDONE    = 0x40
+IRQ_TXDONE    = 0x08
+IRQ_CRCERR    = 0x20
+
+# constants
+FXOSC  = 32000000.0
+FSTEP  = FXOSC / (1 << 19)  # ~61.035 Hz
+
+spi = spidev.SpiDev()
+
+# ===== CRC16-CCITT (0xFFFF, poly 0x1021) =====
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= (b << 8) & 0xFFFF
+        for _ in range(8):
+            if (crc & 0x8000):
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+    
+# ===== GPIO / SPI =====
+def gpio_setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN_RST, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(PIN_DIO0, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+def spi_setup():
+    spi.open(0, 0)                # SPI0 CE0
+    spi.max_speed_hz = 8000000    # <= ~10 MHz ?n v?i SX127x
+    spi.mode = 0
+
+# ===== Reg access =====
+def w(addr, val): spi.xfer2([addr | 0x80, val & 0xFF])
+def r(addr) -> int: return spi.xfer2([addr & 0x7F, 0])[1]
+def bw(addr, payload: bytes): spi.xfer2([addr | 0x80] + list(payload))
+def br(addr, n: int) -> bytes: return bytes(spi.xfer2([addr & 0x7F] + [0]*n)[1:])
+
+def reset_chip():
+    GPIO.output(PIN_RST, GPIO.LOW);  time.sleep(0.01)
+    GPIO.output(PIN_RST, GPIO.HIGH); time.sleep(0.01)
+
+def set_mode(m): w(REG_OP_MODE, MODE_LONG_RANGE_MODE | m)
+
+def set_frequency(hz):
+    frf = int(hz / FSTEP)
+    w(REG_FRF_MSB, (frf >> 16) & 0xFF)
+    w(REG_FRF_MID, (frf >> 8)  & 0xFF)
+    w(REG_FRF_LSB, frf & 0xFF)
+
+def set_tx_power(dbm, pa_boost=True):
+    if pa_boost:
+        w(REG_PA_CONFIG, 0x80 | max(0, min(15, dbm - 2)))
+        w(REG_PA_DAC, 0x87 if dbm > 17 else 0x84)
+    else:
+        w(REG_PA_CONFIG, 0x70 | max(0, min(15, dbm)))
+        w(REG_PA_DAC, 0x84)
+
+def set_ocp(ma):
+    ocp_trim = int((ma - 45)/5) if ma <= 120 else int((ma + 30)/10)
+    ocp_trim = max(0, min(27, ocp_trim))
+    w(REG_OCP, 0x20 | (ocp_trim & 0x1F))
+
+def set_lna_boost(): w(REG_LNA, 0x23)
+
+def bw_to_bits(hz):
+    table = {7800:0, 10400:1, 15600:2, 20800:3, 31250:4, 41700:5, 62500:6, 125000:7, 250000:8, 500000:9}
+    return table.get(hz, 7)
+
+def set_modem(sf, bw_hz, cr_den, crc_on=True, explicit_header=True):
+    bw_bits = bw_to_bits(bw_hz)
+    cr_bits = max(1, min(4, cr_den - 4))  # 4/5->1 .. 4/8->4
+    w(REG_MODEM_CONFIG1, (bw_bits << 4) | (cr_bits << 1) | (0 if explicit_header else 1))
+    sf_bits = max(6, min(12, sf))
+    w(REG_MODEM_CONFIG2, ((sf_bits << 4) & 0xF0) | (0x04 if crc_on else 0x00) | 0x03)
+    w(REG_SYMB_TIMEOUT_LSB, 0xFF)
+    symbol_us = (1 << sf_bits) * 1_000_000.0 / bw_hz
+    w(REG_MODEM_CONFIG3, (0x08 if symbol_us > 16000 else 0x00) | 0x04)  # LDO + AGC
+    if sf_bits >= 11:
+        w(REG_DETECT_OPTIMIZE, 0x0B); w(REG_DETECTION_THRESHOLD, 0x0C)
+    else:
+        w(REG_DETECT_OPTIMIZE, 0x03); w(REG_DETECTION_THRESHOLD, 0x0A)
+
+def set_syncword(sw): w(REG_SYNC_WORD, sw & 0xFF)
+def set_preamble(nsym):
+    w(REG_PREAMBLE_MSB, (nsym >> 8) & 0xFF)
+    w(REG_PREAMBLE_LSB, nsym & 0xFF)
+    
+def enter_rx_continuous():
+    w(REG_FIFO_RX_BASE_ADDR, 0x00)
+    w(REG_FIFO_ADDR_PTR, 0x00)
+    w(REG_DIO_MAPPING1, 0x00)       # DIO0 -> RxDone
+    w(REG_IRQ_FLAGS, 0xFF)          # clear
+    set_mode(MODE_RXCONT)
+
+def read_packet():
+    irq = r(REG_IRQ_FLAGS)
+    if (irq & IRQ_RXDONE) == 0:
+        return None
+    if (irq & IRQ_CRCERR) != 0:
+        w(REG_IRQ_FLAGS, 0xFF)
+        return b"", {"crc_phy_ok": False}
+
+    cur = r(REG_FIFO_RX_CURRENT_ADDR)
+    n   = r(REG_RX_NB_BYTES)
+    w(REG_FIFO_ADDR_PTR, cur)
+    data = br(REG_FIFO, n)
+    w(REG_IRQ_FLAGS, 0xFF)
+
+    snr_reg  = r(REG_PKT_SNR_VALUE)
+    snr_db   = (snr_reg - 256) / 4.0 if snr_reg > 127 else snr_reg / 4.0
+    rssi_dbm = -164 + r(REG_PKT_RSSI_VALUE)
+    return data, {"crc_phy_ok": True, "rssi": rssi_dbm, "snr": snr_db}
+
+def transmit(payload: bytes, timeout_ms=2000):
+    set_mode(MODE_STDBY)
+    w(REG_FIFO_TX_BASE_ADDR, 0x00)
+    w(REG_FIFO_ADDR_PTR, 0x00)
+    bw(REG_FIFO, payload)
+    w(REG_PAYLOAD_LENGTH, len(payload))
+    w(REG_DIO_MAPPING1, 0x40)       # DIO0 -> TxDone
+    w(REG_IRQ_FLAGS, 0xFF)
+    set_mode(MODE_TX)
+
+    t0 = time.time()
+    while True:
+        irq = r(REG_IRQ_FLAGS)
+        if (irq & IRQ_TXDONE): w(REG_IRQ_FLAGS, 0xFF); break
+        if (time.time() - t0) * 1000 > timeout_ms:
+            set_mode(MODE_STDBY)
+            return False
+        time.sleep(0.001)
+
+    enter_rx_continuous()
+    return True
+    
+def lora_begin():
+    reset_chip()
+    w(REG_OP_MODE, MODE_SLEEP | MODE_LONG_RANGE_MODE); time.sleep(0.01)
+    ver = r(REG_VERSION)
+    set_mode(MODE_SLEEP)
+    set_frequency(FREQ_HZ)
+    set_syncword(SYNC_WORD)
+    set_tx_power(TX_POWER_DBM, USE_PA_BOOST)
+    set_ocp(OCP_MA)
+    set_lna_boost()
+    set_preamble(PREAMBLE_SYM)
+    set_modem(SPREADING_SF, BANDWIDTH_HZ, CODERATE_DEN, True, True)
+    w(REG_PAYLOAD_LENGTH, 0xFF)
+    enter_rx_continuous()
+    return ver
+
+# ===== App-layer JSON helpers =====
+def json_core_without_crc(s: str) -> str:
+    p = s.rfind(',"crc":"')
+    return None if p == -1 else (s[:p] + "}")
+
+def parse_crc_hex4(s: str):
+    key = '"crc":"'
+    i = s.rfind(key)
+    if i < 0: return None
+    i += len(key)
+    if i + 4 > len(s): return None
+    try: return int(s[i:i+4], 16)
+    except: return None
+
+def extract_int_field(s: str, key: str) -> int:
+    i = s.find(key);  j = s.find(':', i)
+    if i < 0 or j < 0: return -1
+    j += 1
+    while j < len(s) and s[j].isspace(): j += 1
+    sign = -1 if j < len(s) and s[j] == '-' else 1
+    if sign == -1: j += 1
+    val, anyd = 0, False
+    while j < len(s) and s[j].isdigit():
+        val = val * 10 + (ord(s[j]) - 48); j += 1; anyd = True
+    return sign * val if anyd else -1
+
+def make_ack_full(seq: int, rssi: float, snr: float) -> bytes:
+    ack = {"ack": int(seq), "seq": int(seq), "gw": GWID,
+           "rssi": round(rssi,1), "snr": round(snr,1)}
+    return json.dumps(ack, separators=(',',':')).encode()
+
+def make_ack_min(seq: int) -> bytes:
+    return ('{"ack":%d}' % int(seq)).encode()
+
+def now_s(): return time.time()
+
+# ===== MQTT helpers =====
+pending_cmd = {}              # node -> dict lenh
+pending_lock = threading.Lock()
+
+def mqtt_setup():
+    cli = mqtt.Client(client_id=f"gw-{GWID}", clean_session=True)
+    cli.username_pw_set(MQTT_USER, MQTT_PASS)
+    cli.will_set(MQTT_TOPIC_STATUS, json.dumps({"online": False}), qos=1, retain=True)
+
+    def on_connect(c, *_):
+        c.subscribe(MQTT_TOPIC_CMD, qos=1)
+        c.publish(MQTT_TOPIC_STATUS,
+                  json.dumps({"online": True,
+                              "ts_local": datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')}),
+                  qos=1, retain=True)
+        print(LOG_PREFIX + f"MQTT connected, SUB {MQTT_TOPIC_CMD}")
+
+    def on_message(c, _u, msg):
+        # topic: site/farmA/gw/pi3b/node/<NODE>/downlink/cmd
+        m = re.match(rf"^site/{SITE}/gw/{GWID}/node/([^/]+)/downlink/cmd$", msg.topic)
+        if not m:
+            return
+        node = m.group(1)
+        try:
+            cmd = json.loads(msg.payload.decode())
+            with pending_lock:
+                pending_cmd[node] = cmd   # luu/ghi de lenh cho node
+            print(LOG_PREFIX + f"[MQTT] queue cmd for {node}: {cmd}")
+            mqtt_publish_event(c, "info", f"cmd queued for {node}")
+        except Exception as e:
+            print(LOG_PREFIX + f"[MQTT] bad cmd: {e}")
+            mqtt_publish_event(c, "error", f"bad cmd: {e}")
+
+    cli.on_connect = on_connect
+    cli.on_message = on_message
+    cli.connect(MQTT_HOST, MQTT_PORT, 60)
+    cli.loop_start()
+    return cli
+    
+def mqtt_publish_uplink(cli, node, payload_json_str, rssi, snr):
+    try:
+        core = json.loads(payload_json_str)
+    except Exception:
+        core = {"raw": payload_json_str}
+
+    ts_local = datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+    msg = {
+        "node": node,
+        "data": core,
+        "rssi": round(rssi, 1),
+        "snr":  round(snr, 1),
+        "ts":   ts_local    # CHI GIU LOCAL
+    }
+    cli.publish(MQTT_TOPIC_UPLINK.format(node=node),
+                json.dumps(msg), qos=0, retain=False)
+
+
+def mqtt_publish_event(cli, level, text):
+    cli.publish(MQTT_TOPIC_EVENTS,
+                json.dumps({"level": level,
+                            "msg": text,
+                            "ts": datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')}),
+                qos=0, retain=False)
+
+# ===== main loop =====
+def main():
+    def tidy_exit(sig, frame):
+        print(LOG_PREFIX + "Exit on signal", sig)
+        try:
+            set_mode(MODE_STDBY)
+        finally:
+            try: spi.close()
+            except: pass
+            try: GPIO.cleanup()
+            except: pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, tidy_exit)
+    signal.signal(signal.SIGTERM, tidy_exit)
+
+    gpio_setup()
+    spi_setup()
+    ver = lora_begin()
+    print(LOG_PREFIX + f"Gateway ready (SX127x VER=0x{ver:02X}). Listening...")
+
+    mq = mqtt_setup()
+
+    last_rx_time = now_s()
+    last_seq_logged = None
+
+    while True:
+        pkt = read_packet()
+        if not pkt:
+            if WATCHDOG_SEC and (now_s() - last_rx_time) > WATCHDOG_SEC:
+                print(LOG_PREFIX + "Watchdog: re-init radio after inactivity")
+                lora_begin()
+                last_rx_time = now_s()
+            time.sleep(0.002)
+            continue
+
+        data, meta = pkt
+        last_rx_time = now_s()
+
+        if not meta.get("crc_phy_ok", False):
+            print(LOG_PREFIX + "[RX] CRC_PHY_ERROR (dropped)")
+            mqtt_publish_event(mq, "warn", "CRC_PHY_ERROR dropped")
+            continue
+
+        try:
+            s = data.decode('utf-8', errors='ignore').strip()
+        except Exception:
+            print(LOG_PREFIX + "[RX] decode error")
+            mqtt_publish_event(mq, "warn", "decode error")
+            continue
+
+        core = json_core_without_crc(s)
+        rx_crc = parse_crc_hex4(s)
+        if not core or rx_crc is None:
+            print(LOG_PREFIX + "No app CRC field; drop.")
+            mqtt_publish_event(mq, "warn", "no app CRC field")
+            continue
+        calc = crc16_ccitt(core.encode('utf-8'))
+        if calc != rx_crc:
+            print(LOG_PREFIX + f"App CRC FAIL (calc=0x{calc:04X}, rx=0x{rx_crc:04X}); drop.")
+            mqtt_publish_event(mq, "warn", f"app CRC fail: calc=0x{calc:04X}, rx=0x{rx_crc:04X}")
+            continue
+
+        # log giam duplicate
+        seq = extract_int_field(s, '"seq"')
+        if seq != last_seq_logged or PRINT_DUPLICATES:
+            print(LOG_PREFIX + f"[RX] {s}  RSSI={meta['rssi']:.1f} dBm  SNR={meta['snr']:.1f} dB")
+            last_seq_logged = seq
+
+        # xac dinh node trong payload
+        try:
+            node = json.loads(s).get("node", "B")
+        except Exception:
+            node = "B"
+
+        # publish uplink len MQTT
+        mqtt_publish_uplink(mq, node, s, meta["rssi"], meta["snr"])
+
+        # tao ACK (kem lenh neu co)
+        if seq >= 0:
+            time.sleep(ACK_DELAY_S)
+            with pending_lock:
+                cmd_for_node = pending_cmd.get(node)
+
+            if cmd_for_node:
+                ack_obj = {"ack": int(seq), "cmd": cmd_for_node}
+                ack_bytes = json.dumps(ack_obj, separators=(',',':')).encode()
+                print(LOG_PREFIX + f"[ACK with cmd] node={node} {ack_obj}")
+            else:
+                # ACK toi thieu
+                ack_bytes = make_ack_min(seq)
+
+            ok_any = False
+            for i in range(ACK_REPEATS):
+                ok_any |= transmit(ack_bytes, timeout_ms=2000)
+                if i + 1 < ACK_REPEATS: time.sleep(ACK_SPACING_S)
+            print(LOG_PREFIX + f"ACK seq={seq} x{ACK_REPEATS}: {'OK' if ok_any else 'TIMEOUT'}")
+
+            # neu gui ACK ok va co lenh -> xoa khoi hang doi
+            if ok_any and cmd_for_node:
+                with pending_lock:
+                    pending_cmd.pop(node, None)
+        else:
+            print(LOG_PREFIX + "No 'seq' field; skip ACK.")
+
+if __name__ == "__main__":
+    main()
